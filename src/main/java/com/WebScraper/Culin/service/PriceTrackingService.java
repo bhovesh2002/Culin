@@ -19,6 +19,8 @@ import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 @Service
 public class PriceTrackingService {
@@ -29,31 +31,66 @@ public class PriceTrackingService {
     @Autowired
     private UserRepository userRepository;
 
+//    @Scheduled(fixedRate = 30000)
+//    public void trackProductPrice(){
+//        System.out.println("RUNNING 1 HOUR MACHINE!!!");
+//        List<Product> products = productRepository.findAll();
+//        boolean newLowerPriceFound = false;
+//        if(products != null){
+//            for(Product product : products){
+//                Map<String, Map<String, Integer>> prices = priceTrack(product.getProductName());
+//                for(Map.Entry<String,Integer> entry : prices.entrySet()){
+//                    String site = entry.getKey();
+//                    int price = entry.getValue();
+//                    if(price < product.getCurrentPrice()){
+//                        System.out.println("NEW CURRENT LOWEST PRICE: " + price + " AT SITE: " + site);
+//                        product.setCurrentPrice(price);
+//                        product.setLink(site);
+//                        newLowerPriceFound = true;
+//                    }
+//                }
+//                if(newLowerPriceFound){
+//                    User user = userRepository.findByUsername(product.getUsername());
+//                    sendEmail(user, product);
+//                }
+//            }
+//        }
+//    }
+
     @Scheduled(fixedRate = 30000)
-    public void trackProductPrice(){
+    public void trackProductPrice() {
         System.out.println("RUNNING 1 HOUR MACHINE!!!");
         List<Product> products = productRepository.findAll();
         boolean newLowerPriceFound = false;
-        if(products != null){
-            for(Product product : products){
-                Map<String, Integer> prices = priceTrack(product.getProductName());
-                for(Map.Entry<String,Integer> entry : prices.entrySet()){
+
+        if (products != null) {
+            for (Product product : products) {
+                Map<String, Map<String, String>> prices = priceTrack(product.getProductName());
+                for (Map.Entry<String, Map<String, String>> entry : prices.entrySet()) {
                     String site = entry.getKey();
-                    int price = entry.getValue();
-                    if(price < product.getCurrentPrice()){
-                        System.out.println("NEW CURRENT LOWEST PRICE: " + price + " AT SITE: " + site);
-                        product.setCurrentPrice(price);
-                        product.setLink(site);
-                        newLowerPriceFound = true;
+                    String priceString = entry.getValue().get("price");
+                    String realLink = entry.getValue().get("url");
+
+                    if (priceString != null) {
+                        int price = Integer.parseInt(priceString);
+
+                        if (price < product.getCurrentPrice()) {
+                            System.out.println("NEW CURRENT LOWEST PRICE: " + price + " AT SITE: " + site);
+                            product.setCurrentPrice(price);
+                            product.setLink(realLink);  // Set the real link instead of the site
+                            newLowerPriceFound = true;
+                        }
                     }
                 }
-                if(newLowerPriceFound){
+
+                if (newLowerPriceFound) {
                     User user = userRepository.findByUsername(product.getUsername());
-                    sendEmail(user, product);
+                    sendEmail(user, product);  // Notify the user with the new price
                 }
             }
         }
     }
+
 
     public void sendEmail(User user, Product product){
         String nodePath = ".\\..\\NodeJs\\node.exe";
@@ -90,29 +127,35 @@ public class PriceTrackingService {
     }
 
 
-    public Map<String, Integer> priceTrack(String product) {
-        Map<String, Integer> prices = new HashMap<>();
+    public Map<String, Map<String,String>> priceTrack(String product){
+        Map<String, Map<String,String>> prices = new HashMap<>();
         ExecutorService executorService = Executors.newFixedThreadPool(Constants.SITE_LIST.length);
-
-        for (String site : Constants.SITE_LIST) {
+        for(String site : Constants.SITE_LIST){
             executorService.submit(() -> {
-                int price = search(site, product);
-                synchronized (prices) { // To avoid race conditions when modifying the map
-                    prices.put(site, price);
+                System.out.println();
+                Map<String, String> data = search(site, product);
+                if(data != null){
+                    prices.put(site, data);
                 }
             });
         }
-
         shutdownAndAwaitTermination(executorService);
+
         return prices;
     }
 
-    public int search(String site, String name) {
-        String priceStr = "";
+    public Map<String,String> search(String site,String name){
+        String price = "";
+        String productName = "";
+        String url = "";
+        String rating = "";
         String nodePath = ".\\..\\NodeJs\\node.exe";
         String scriptPath = ".\\..\\puppeteer\\index.js";
 
-        try {
+        Map<String,String> data = new HashMap<>();
+
+        try{
+
             String command = String.format(
                     "$env:SITE_NAME='%s'; $env:SEARCH_QUERY='%s'; & '%s' '%s'",
                     site, name, nodePath, scriptPath
@@ -124,31 +167,39 @@ public class PriceTrackingService {
 
             BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
             String line;
-            while ((line = reader.readLine()) != null) {
-                if (line.contains("Product Price:")) {
-                    priceStr = line.split("Product Price:")[1].trim().replaceAll("[^0-9]", "");
+            while ((line = reader.readLine()) != null){
+                if(line.contains("Product Price:")){
+                    price = line.split("Product Price:")[1].trim().replaceAll("[^0-9]", "");
+                }
+                if(line.contains("Product Name:")){
+                    productName = line.split("Product Name:")[1].trim();
+                }
+                if(line.contains("Page URL:")){
+                    url = line.split("Page URL:")[1].trim();
+                }
+                if(line.contains("Product Rating:")){
+                    rating = getRating(line.split("Product Rating:")[1].trim());
                 }
                 System.out.println(line);
             }
             reader.close();
             int exitVal = process.waitFor();
-            if (exitVal != 0) {
+            if(exitVal != 0){
                 System.out.println("Abnormal Behaviour Detected! Mission Abort!");
             }
-        } catch (InterruptedException ie) {
+        }catch(InterruptedException ie){
             System.out.println(ie);
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
-
-        // Convert price to integer, return 0 if not parsable
-        int price = 0;
-        try {
-            price = Integer.parseInt(priceStr);
-        } catch (NumberFormatException nfe) {
-            System.out.println("Error parsing price: " + nfe.getMessage());
+        if(productName == null || url == null || productName == "" || url == ""){
+            return null;
         }
-        return price;
+        data.put("productName", productName);
+        data.put("price",price);
+        data.put("rating", rating);
+        data.put("url", url);
+        return data;
     }
 
     public void shutdownAndAwaitTermination(ExecutorService executorService){
@@ -160,6 +211,25 @@ public class PriceTrackingService {
         }catch (InterruptedException ie){
             executorService.shutdownNow();
             System.out.println("IE: "+ ie);
+        }
+    }
+
+    public String getRating(String text){
+        // Regular expression to match the rating number
+        String regex = "\\d+(\\.\\d+)?";
+
+        // Compile the pattern
+        Pattern pattern = Pattern.compile(regex);
+
+        return extractRating(text, pattern);
+    }
+
+    public static String extractRating(String text, Pattern pattern) {
+        Matcher matcher = pattern.matcher(text);
+        if (matcher.find()) {
+            return matcher.group();  // Return the first match (the rating number)
+        } else {
+            return "Rating not found";
         }
     }
 
